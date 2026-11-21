@@ -1,0 +1,1092 @@
+Sim2Occ | Source files for Section III (Method)
+
+Source revision: e9286878cc0ea756af985e828837af07f348e686
+
+Contents (search for BEGIN FILE followed by the path)
+
+  README.md                 Overview
+  sim2occ/roads.py          Scene construction
+  sim2occ/assets.py         Scene construction
+  sim2occ/projection.py     Scene construction
+  sim2occ/labels.py         Occupancy labels
+  sim2occ/protocol.py       RPA parameters
+  sim2occ/tokens.py         RPA descriptors
+  sim2occ/transport.py      RPA alignment and loss
+  sim2occ/adapters.py       Model adapters
+
+===== BEGIN FILE README.md =====
+# Sim2Occ
+
+**Selective feature transfer from simulated dense traffic scenes for 3D semantic occupancy prediction.** Sim2Occ matches observed traffic layouts to CARLA roads and assets. During training, retrieval-guided partial alignment (RPA, called MatchMass-Occ in the experiments) matches local real features to same-class simulated regions. The fraction of matched mass sets the strength of the auxiliary target.
+
+| Module | Implementation |
+| --- | --- |
+| [Roads](sim2occ/roads.py) and [assets](sim2occ/assets.py) | Rank road and sidewalk layouts with distance-weighted Dice, then rank same-class assets by their fit across camera views. |
+| [Occupancy labels](sim2occ/labels.py) | Resolve measured surface and free-space evidence. Ambiguous endpoints remain unknown. |
+| [Tokens](sim2occ/tokens.py) and [alignment](sim2occ/transport.py) | Construct local descriptors, retrieve candidates, solve partial transport and compute the transfer loss. |
+| [Model adapters](sim2occ/adapters.py) | Sample dense occupancy features on a canonical voxel grid and cap the auxiliary gradient relative to the task gradient. |
+| [Comparison methods](sim2occ/baselines.py) and [metrics](sim2occ/metrics.py) | CCSA, Deep CORAL, FDA and confusion-matrix scoring for 17 occupied semantic classes. |
+
+## Run a CPU example
+
+From the repository root, install the dependencies with `python -m pip install -r requirements.txt`. This example aligns one real token with a synthetic memory entry and backpropagates the auxiliary loss.
+
+```python
+import torch
+from sim2occ.protocol import RPA
+from sim2occ.tokens import TokenRecord, select_descriptors
+from sim2occ.transport import align_queries, transfer_loss
+
+labels = torch.full((8, 8, 4), 17)  # free space
+labels[3, 3, 1] = 4                 # one occupied car voxel
+visible = torch.ones_like(labels, dtype=torch.bool)
+source, _ = select_descriptors(labels, visible, "sim", "scene_s", seed=0)
+query, _ = select_descriptors(labels, visible, "real", "scene_r", seed=0)
+student = torch.tensor([[1., 0.]], requires_grad=True)
+bank = [TokenRecord(source[0], torch.tensor([1., 0.]), torch.tensor([0.8, 0.6]))]
+target, mass, keep, _ = align_queries(RPA, query, student.detach(), bank, seed=0, event=0)
+loss = transfer_loss(student, target, mass, keep, n_all=len(query))
+loss.backward()
+print(f"accepted={int(keep.sum())}, matched mass={mass.item():.4f}, loss={loss.item():.4f}")
+```
+
+For the FlashOCC experiments, the source bank used 888 synthetic frames, up to 64 records per class and 1,088 overall. The default ran retrieval every four updates with 16 same-class candidates, geometry weight 0.5, dustbin cost 0.5, transfer coefficient `0.5 × matched mass` and an auxiliary-gradient cap of 0.1. The original 888 captures used layouts from 29 validation scenes. Account for this overlap when evaluating unseen-scene generalization.
+
+This lightweight release contains the method components. Training environments, CARLA assets, nuScenes data and model weights are supplied separately by their respective providers.
+===== END FILE README.md =====
+
+===== BEGIN FILE sim2occ/roads.py =====
+"""Match a reference BEV road and sidewalk raster to a library of CARLA anchors."""
+import numpy as np
+
+
+def rank_anchors(grid, reference, rasters, anchors, limit=48):
+    """Return diverse candidates using the road and sidewalk Dice scores.
+
+    grid contains ego-frame XY cell centers in metres, with shape [N, 2].
+    reference has shape [N, 2] and rasters [A, N, 2]. Channels are road and sidewalk.
+    Each anchor supplies map, xyz in metres, and yaw in degrees.
+    """
+    grid = np.asarray(grid)
+    reference = np.asarray(reference, dtype=np.float32)
+    rasters = np.asarray(rasters, dtype=np.float32)
+    if (grid.ndim != 2 or grid.shape[1] != 2 or reference.shape != grid.shape
+            or rasters.shape != (len(anchors), *grid.shape)):
+        raise ValueError("Grid, two-channel rasters and anchor count must agree")
+    if limit < 1:
+        raise ValueError("The candidate limit must be positive")
+    weights = (.5 + 1.5 * np.exp(-np.sum(grid**2, axis=1) / (2 * 20**2))).astype(np.float32)
+    weighted = rasters * weights[None, :, None]
+    intersections = np.stack([reference[:, c] @ weighted[:, :, c].T for c in range(2)], axis=-1)
+    denominator = (reference * weights[:, None]).sum(0) + weighted.sum(1)
+    dice = 2 * intersections / np.maximum(denominator, 1)
+    scores = .7 * dice[:, 0] + .3 * dice[:, 1]
+    selected, per_map = [], {}
+    for i in np.argsort(-scores):
+        anchor = anchors[i]
+        town = anchor["map"]
+        if per_map.get(town, 0) >= 8:
+            continue
+        if any(old["map"] == town
+               and np.linalg.norm(np.asarray(anchor["xyz"][:2]) - old["xyz"][:2]) < 18
+               and abs((anchor["yaw"] - old["yaw"] + 180) % 360 - 180) < 20
+               for old in selected):
+            continue
+        selected.append(dict(anchor, anchor_index=int(i), score=float(scores[i]),
+                             road_dice=float(dice[i, 0]), sidewalk_dice=float(dice[i, 1])))
+        per_map[town] = per_map.get(town, 0) + 1
+        if len(selected) == limit:
+            break
+    return selected
+===== END FILE sim2occ/roads.py =====
+
+===== BEGIN FILE sim2occ/assets.py =====
+"""Rank same-class CARLA assets against the reference camera projections."""
+import math
+import numpy as np
+
+from .projection import compare
+
+SETTINGS={'center_3d_tolerance_m':.02,'center_px_floor':3.,'center_px_diagonal_fraction':.01,'center_px_cap':8.,'footprint_iou_min':.50,'footprint_bbox_center_floor_px':6.,'footprint_bbox_center_diagonal_fraction':.08,'image_edge_sliver_max_px':32.,'strict_reference_iou':.70,'source_resolution':[1600,900]}
+
+def diag(bb):
+ return float(math.hypot(bb[2]-bb[0],bb[3]-bb[1])) if bb else 0.
+
+
+def edge_sliver(bb):
+ if not bb:return False
+ x0,y0,x1,y1=bb
+ return (x0<=.01 or y0<=.01 or x1>=1599.99 or y1>=899.99) and min(x1-x0,y1-y0)<=SETTINGS['image_edge_sliver_max_px']
+
+
+def view_review(v):
+ a,b=v['source'],v['rendered'];active=a['in_image'] or b['in_image'];dd=diag(a.get('bbox_xyxy'))
+ tol=min(SETTINGS['center_px_cap'],max(SETTINGS['center_px_floor'],SETTINGS['center_px_diagonal_fraction']*dd))
+ ce=v.get('center_error_source_px');warnings=[];issues=[]
+ center_ok=not active or (ce is not None and math.isfinite(ce) and ce<=tol)
+ if not center_ok:issues.append('IMAGE_PROJECTED_CENTER_DRIFT_OR_UNVERIFIED')
+ if not active:shape=True
+ elif a['in_image']!=b['in_image']:
+  # A shape-dependent sliver at an image boundary is not projected-center drift.
+  sliver=edge_sliver(a.get('bbox_xyxy') or b.get('bbox_xyxy'));shape=bool(sliver and center_ok)
+  (warnings if shape else issues).append('IMAGE_EDGE_SHAPE_VISIBILITY_DIFFERENCE' if shape else 'LARGE_FOOTPRINT_VISIBILITY_DIFFERENCE')
+ else:
+  iou=v.get('bbox_iou');bc=v.get('bbox_center_error_source_px');bt=max(SETTINGS['footprint_bbox_center_floor_px'],SETTINGS['footprint_bbox_center_diagonal_fraction']*dd)
+  shape=iou is not None and math.isfinite(iou) and iou>=SETTINGS['footprint_iou_min'] and bc is not None and math.isfinite(bc) and bc<=bt
+  if not shape:issues.append('LARGE_ASSET_SHAPE_OR_POSE_DIFFERENCE')
+  elif iou<SETTINGS['strict_reference_iou'] or not v.get('footprint_pass',True):warnings.append('ACCEPTED_APPROXIMATE_ASSET_SHAPE_OR_POSE')
+ if center_ok and active and ce is not None and ce>1.:warnings.append('ACCEPTED_SMALL_PROJECTED_CENTER_ERROR')
+ return {'position_pass':bool(center_ok),'footprint_pass':bool(shape),'center_tolerance_source_px':tol,'issues':issues,'warnings':warnings}
+
+
+def assess_asset(obj, asset, cameras):
+    model = dict(obj, half_size_lwh=asset['box']['extent'])
+    views = {}
+    old_error = 0.0
+    source_views = 0
+    for name, cam in cameras.items():
+        projection = compare(obj, model, cam)
+        review = view_review(projection)
+        views[name] = {
+            'source_in_image': projection['source']['in_image'],
+            'rendered_in_image': projection['rendered']['in_image'],
+            'bbox_iou': projection['bbox_iou'],
+            'bbox_center_error_source_px': projection['bbox_center_error_source_px'],
+            'position_pass': review['position_pass'],
+            'footprint_pass': review['footprint_pass'],
+            'issues': review['issues'], 'warnings': review['warnings'],
+        }
+        if projection['source']['in_image']:
+            old_error += (1 - (projection['bbox_iou'] or 0)) * 10 + (projection['bbox_center_error_source_px'] or 0) / 10
+            source_views += 1
+    size = float(np.sum(np.abs(np.log(np.maximum(asset['box']['extent'], .01) / np.maximum(obj['half_size_lwh'], .01)))))
+    failures = sum(not (v['position_pass'] and v['footprint_pass']) for v in views.values())
+    score = old_error / max(source_views, 1) + size * .1
+    return {
+        'type_id': asset['type_id'], 'kind': asset['kind'],
+        'failed_view_count': failures, 'all_views_pass': failures == 0,
+        'legacy_average_score': score,
+        'asset_half_size_lwh': list(asset['box']['extent']),
+        'views': views,
+    }
+
+
+def ranking_key(review):
+    return (review['failed_view_count'], review['legacy_average_score'])
+
+
+def rank_assets(obj, choices, cameras):
+    scored = [(a, assess_asset(obj, a, cameras)) for a in choices]
+    scored.sort(key=lambda item: ranking_key(item[1]))
+    return scored
+===== END FILE sim2occ/assets.py =====
+
+===== BEGIN FILE sim2occ/projection.py =====
+"""Pixel geometry contract. All errors expressed at original 1600x900 resolution."""
+import math,itertools
+import numpy as np
+H=np.diag([1.,-1.,1.])
+C=np.array([[0.,0.,1.],[1.,0.,0.],[0.,-1.,0.]])
+CAMERAS=['CAM_FRONT_LEFT','CAM_FRONT','CAM_FRONT_RIGHT','CAM_BACK_LEFT','CAM_BACK','CAM_BACK_RIGHT']
+SIGNS=np.array(list(itertools.product([-1.,1.],repeat=3)))
+EDGES=[(i,j) for i in range(8) for j in range(i+1,8) if np.sum(SIGNS[i]!=SIGNS[j])==1]
+def quat(q):
+ q=np.asarray(q,dtype=float);q=q/np.linalg.norm(q);w,x,y,z=q
+ return np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],[2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],[2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
+def pose(translation,rotation):
+ t=np.eye(4);t[:3,:3]=quat(rotation);t[:3,3]=translation;return t
+def inv(t):
+ t=np.asarray(t);r=np.eye(4);r[:3,:3]=t[:3,:3].T;r[:3,3]=-r[:3,:3]@t[:3,3];return r
+def points(t,p):return np.asarray(p)@np.asarray(t)[:3,:3].T+np.asarray(t)[:3,3]
+def camera_mount(cam):
+ q=np.asarray(cam['T_reference_ego_from_optical']);t=np.eye(4);t[:3,:3]=H@q[:3,:3]@C.T;t[:3,3]=H@q[:3,3];assert np.linalg.det(t[:3,:3])>.999999;return t
+def corners(center,rotation,half):return SIGNS*np.asarray(half)@np.asarray(rotation).T+np.asarray(center)
+def projected(center,rotation,half,cam):
+ t=inv(cam['T_reference_ego_from_optical']);v=points(t,corners(center,rotation,half));p=points(t,[center])[0];K=np.asarray(cam['cam_intrinsic']);near=.05
+ uv=(K@p)[:2]/p[2] if p[2]>near else None
+ visible=[x for x in v if x[2]>=near]
+ for i,j in EDGES:
+  a,b=v[i],v[j]
+  if (a[2]>=near)!=(b[2]>=near):
+   visible.append(a+(b-a)*(near-a[2])/(b[2]-a[2]))
+ bb=None
+ if visible:
+  vv=np.array(visible);xy=vv@K.T;xy=xy[:,:2]/xy[:,2,None]
+  lo=np.maximum(xy.min(0),[0,0]);hi=np.minimum(xy.max(0),cam['image_size'])
+  if np.all(hi>lo):bb=np.r_[lo,hi]
+ return {'center_uv':None if uv is None else uv.tolist(),'center_depth_m':float(p[2]),'bbox_xyxy':None if bb is None else bb.tolist(),'in_image':bb is not None}
+def compare(source,rendered,cam,render_cam=None):
+ a=projected(source['center_ego_rh'],source['rotation_ego_rh'],source['half_size_lwh'],cam)
+ b=projected(rendered['center_ego_rh'],rendered['rotation_ego_rh'],rendered['half_size_lwh'],render_cam or cam)
+ ce=None
+ if a['center_uv'] is not None and b['center_uv'] is not None:
+  ce=float(np.linalg.norm(np.array(a['center_uv'])-b['center_uv']))
+ iou=bc=None;tol=None
+ if a['bbox_xyxy'] is not None and b['bbox_xyxy'] is not None:
+  x,y=np.array(a['bbox_xyxy']),np.array(b['bbox_xyxy']);area=lambda z:float(np.prod(np.maximum(z[2:]-z[:2],0)))
+  intersection=float(np.prod(np.maximum(np.minimum(x[2:],y[2:])-np.maximum(x[:2],y[:2]),0)));iou=intersection/max(area(x)+area(y)-intersection,1e-9)
+  bc=float(np.linalg.norm((x[:2]+x[2:]-y[:2]-y[2:])/2));tol=max(3.,.03*float(np.linalg.norm(x[2:]-x[:2])))
+ position=(not a['in_image'] and not b['in_image']) or (a['in_image']==b['in_image'] and ce is not None and ce<=1.0)
+ footprint=(not a['in_image'] and not b['in_image']) or (iou is not None and iou>=.70 and bc<=tol)
+ return {'source':a,'rendered':b,'center_error_source_px':ce,'bbox_center_error_source_px':bc,'bbox_center_tolerance_source_px':tol,'bbox_iou':iou,'position_pass':bool(position),'footprint_pass':bool(footprint),'pass':bool(position and footprint)}
+===== END FILE sim2occ/projection.py =====
+
+===== BEGIN FILE sim2occ/labels.py =====
+"""Candidate observed-occupancy labels; pure resolver, no file or training edits.
+
+Input evidence must come from synchronized, calibrated CARLA measurements.
+Free-ray traversal, semantic mapping and visibility masks are kept unchanged.
+"""
+import numpy as np
+
+VERSION = 'carla_observed_occ_v0.3_surface_priority_candidate'
+
+
+def resolve(grid):
+    """Accept an EvidenceGrid-compatible object and return labels plus audit arrays.
+
+    A known, unambiguous surface endpoint wins over a free traversal in the same
+    coarse voxel. Unknown endpoints and multiple known classes remain ignored.
+    Diagnostic conflict flags describe raw evidence, not final label validity.
+    """
+    old = grid.finish()
+    result = {key: value.copy() for key, value in old.items()}
+    bits = np.asarray(grid.bits)
+    occupied = np.asarray(grid.occupied, dtype=bool)
+    ambiguous = np.asarray(grid.ambiguous, dtype=bool)
+    if bits.dtype != np.uint32:
+        raise ValueError('Expected uint32 semantic bitset')
+    if not (bits.shape == occupied.shape == ambiguous.shape == old['semantics'].shape):
+        raise ValueError('Evidence shapes do not agree')
+    if np.any(bits & np.uint32(~((1 << 17) - 1) & 0xffffffff)):
+        raise ValueError('Only occupied semantic IDs 0..16 are accepted')
+    if np.any(((bits != 0) | ambiguous) & ~occupied):
+        raise ValueError('Semantic evidence without a surface endpoint')
+    classes_conflict = (bits & (bits - np.uint32(1))) != 0
+    eligible = occupied & (bits != 0) & ~classes_conflict & ~ambiguous
+    semantic = np.full(bits.shape, 255, dtype=np.uint8)
+    semantic[np.asarray(grid.free, dtype=bool) & ~occupied] = 17
+    for class_id in range(17):
+        semantic[eligible & (bits == np.uint32(1 << class_id))] = class_id
+    result['semantics'] = semantic
+    result['mask_label_valid'] = semantic != 255
+    changed = semantic != old['semantics']
+    if np.any(changed & ((old['semantics'] != 255) | (semantic >= 17))):
+        raise AssertionError('Resolver may only recover ignored occupied endpoints')
+    indices = np.argwhere(changed).astype(np.int32)
+    audit = {
+        'indices': indices,
+        'old_semantics': old['semantics'][changed].copy(),
+        'new_semantics': semantic[changed].copy(),
+        'reason_code': np.ones(int(changed.sum()), dtype=np.uint8),
+    }
+    return result, audit
+===== END FILE sim2occ/labels.py =====
+
+===== BEGIN FILE sim2occ/protocol.py =====
+"""Default parameters of retrieval-guided partial alignment (MatchMass-Occ)."""
+from dataclasses import asdict, dataclass
+
+GEOMETRY_WEIGHT = 0.5
+SINKHORN_EPSILON = 0.05
+SINKHORN_MAX_ITER = 100
+SINKHORN_MARGINAL_TOLERANCE = 0.01
+
+@dataclass(frozen=True)
+class MethodSpec:
+    name: str
+    memory: bool
+    replay: bool = False
+    prototype: bool = False
+    module_a: bool = False
+    module_b: bool = False
+    random_candidates: bool = False
+    shuffle_values: bool = False
+    bank_domain: str = "none"
+
+    def to_dict(self):
+        return asdict(self)
+
+
+RPA = MethodSpec("B", memory=True, module_b=True, bank_domain="source")
+===== END FILE sim2occ/protocol.py =====
+
+===== BEGIN FILE sim2occ/tokens.py =====
+"""Deterministic occupancy-token construction and serializable memory banks."""
+import hashlib
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+WINDOW = 5
+HALF = WINDOW // 2
+Z_BINS = 4
+XY_BINS = 2
+DESC_BINS = XY_BINS * XY_BINS * Z_BINS
+
+
+def _stable_int(*parts) -> int:
+    payload = "|".join(str(x) for x in parts).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _coordinate_order(coords: torch.Tensor, seed: int, frame_token: str,
+                      class_id: int, limit: int) -> List[Tuple[int, int]]:
+    """Return the lowest fixed-hash coordinates without Python hashing every cell.
+
+    A dense road-surface class can contain tens of thousands of columns.  Calling
+    hashlib once per column retained large temporary allocator arenas during a
+    full 171-frame bank build.  This vectorized SplitMix64 permutation preserves
+    the frozen hash-sampling meaning while retaining only the at-most-32 entries
+    that the image-level round robin can ever consume.
+    """
+    if coords.numel() == 0 or limit <= 0:
+        return []
+    xy = coords.detach().cpu().numpy().astype(np.uint64, copy=False)
+    base = np.uint64(_stable_int(seed, frame_token, class_id, "coordinate"))
+    with np.errstate(over="ignore"):
+        values = base ^ (xy[:, 0] * np.uint64(0x9E3779B97F4A7C15))
+        values ^= xy[:, 1] * np.uint64(0xBF58476D1CE4E5B9)
+        values = (values ^ (values >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        values = (values ^ (values >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        values ^= values >> np.uint64(31)
+    order = np.lexsort((xy[:, 1], xy[:, 0], values))[:limit]
+    return [(int(xy[i, 0]), int(xy[i, 1])) for i in order]
+
+
+@dataclass
+class TokenDescriptor:
+    identity: str
+    frame_token: str
+    scene_token: str
+    class_id: int
+    x: int
+    y: int
+    g0: torch.Tensor
+    support: torch.Tensor
+    occupancy: torch.Tensor
+    occupancy_valid: torch.Tensor
+    boundary: torch.Tensor
+
+    def as_dict(self) -> Dict:
+        return {
+            "identity": self.identity,
+            "frame_token": self.frame_token,
+            "scene_token": self.scene_token,
+            "class_id": int(self.class_id),
+            "x": int(self.x),
+            "y": int(self.y),
+            "g0": self.g0.detach().cpu(),
+            "support": self.support.detach().cpu(),
+            "occupancy": self.occupancy.detach().cpu(),
+            "occupancy_valid": self.occupancy_valid.detach().cpu(),
+            "boundary": self.boundary.detach().cpu(),
+        }
+
+    @classmethod
+    def from_dict(cls, row: Dict):
+        return cls(**row)
+
+
+@dataclass
+class TokenRecord:
+    descriptor: TokenDescriptor
+    key: torch.Tensor
+    value: torch.Tensor
+
+    def as_dict(self) -> Dict:
+        row = self.descriptor.as_dict()
+        row.update(key=self.key.detach().cpu(), value=self.value.detach().cpu())
+        return row
+
+    @classmethod
+    def from_dict(cls, row: Dict):
+        desc_keys = {
+            "identity", "frame_token", "scene_token", "class_id", "x", "y",
+            "g0", "support", "occupancy", "occupancy_valid", "boundary",
+        }
+        desc = TokenDescriptor.from_dict({k: row[k] for k in desc_keys})
+        return cls(desc, row["key"], row["value"])
+
+
+def _bounds(x: int, y: int, nx: int, ny: int) -> Tuple[int, int, int, int]:
+    return max(0, x - HALF), min(nx, x + HALF + 1), max(0, y - HALF), min(ny, y + HALF + 1)
+
+
+def _boundary_stats(labels: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Counts known 6-neighbour geometry/class boundaries and known interiors."""
+    occupied = labels < 17
+    geom = torch.zeros_like(valid, dtype=torch.bool)
+    semantic = torch.zeros_like(valid, dtype=torch.bool)
+    for axis in range(3):
+        left = [slice(None)] * 3
+        right = [slice(None)] * 3
+        left[axis] = slice(None, -1)
+        right[axis] = slice(1, None)
+        left, right = tuple(left), tuple(right)
+        supported = valid[left] & valid[right]
+        dg = supported & (occupied[left] != occupied[right])
+        ds = supported & occupied[left] & occupied[right] & (labels[left] != labels[right])
+        geom[left] |= dg
+        geom[right] |= dg
+        semantic[left] |= ds
+        semantic[right] |= ds
+    semantic &= ~geom
+    interior = valid & ~(geom | semantic)
+    return torch.tensor(
+        [int(geom.sum()), int(semantic.sum()), int(interior.sum())], dtype=torch.int64
+    )
+
+
+def describe_token(
+    semantics: torch.Tensor,
+    valid: torch.Tensor,
+    frame_token: str,
+    scene_token: str,
+    class_id: int,
+    x: int,
+    y: int,
+) -> TokenDescriptor:
+    """Build g0/g1 from a [X,Y,Z] label grid without treating unknown as free."""
+    if semantics.ndim != 3 or valid.shape != semantics.shape:
+        raise ValueError("expected aligned [X,Y,Z] semantics and valid mask")
+    nx, ny, nz = semantics.shape
+    x0, x1, y0, y1 = _bounds(x, y, nx, ny)
+    local = semantics[x0:x1, y0:y1, :]
+    known = valid[x0:x1, y0:y1, :].bool() & local.ne(255)
+    cls = known & local.eq(int(class_id))
+    coords = torch.nonzero(cls, as_tuple=False)
+    if coords.numel() == 0:
+        raise ValueError("token center class has no known occupied support")
+    z = coords[:, 2].float()
+    mean_h = (z.mean() + 0.5) / float(nz)
+    std_h = z.std(unbiased=False) / float(nz)
+    span_x = (coords[:, 0].max() - coords[:, 0].min() + 1).float() / float(WINDOW)
+    span_y = (coords[:, 1].max() - coords[:, 1].min() + 1).float() / float(WINDOW)
+    g0 = torch.stack((mean_h, std_h, span_x, span_y)).to(torch.float32)
+
+    support = torch.zeros(DESC_BINS, dtype=torch.float32)
+    occupancy = torch.zeros(DESC_BINS, dtype=torch.float32)
+    occupancy_valid = torch.zeros(DESC_BINS, dtype=torch.bool)
+    cursor = 0
+    lx, ly, _ = local.shape
+    for bx in range(XY_BINS):
+        xa = (bx * lx) // XY_BINS
+        xb = ((bx + 1) * lx) // XY_BINS
+        for by in range(XY_BINS):
+            ya = (by * ly) // XY_BINS
+            yb = ((by + 1) * ly) // XY_BINS
+            for bz in range(Z_BINS):
+                za = (bz * nz) // Z_BINS
+                zb = ((bz + 1) * nz) // Z_BINS
+                k = known[xa:xb, ya:yb, za:zb]
+                c = cls[xa:xb, ya:yb, za:zb]
+                possible = k.numel()
+                count = int(k.sum())
+                support[cursor] = 0.0 if possible == 0 else count / float(possible)
+                if count:
+                    occupancy[cursor] = float(c.sum()) / float(count)
+                    occupancy_valid[cursor] = True
+                cursor += 1
+    identity = "%s:%02d:%03d:%03d" % (frame_token, class_id, x, y)
+    return TokenDescriptor(
+        identity=identity,
+        frame_token=frame_token,
+        scene_token=scene_token,
+        class_id=int(class_id),
+        x=int(x),
+        y=int(y),
+        g0=g0,
+        support=support,
+        occupancy=occupancy,
+        occupancy_valid=occupancy_valid,
+        boundary=_boundary_stats(local, known),
+    )
+
+
+def select_descriptors(
+    semantics: torch.Tensor,
+    valid: torch.Tensor,
+    frame_token: str,
+    scene_token: str,
+    seed: int,
+    max_tokens: int = 32,
+) -> Tuple[List[TokenDescriptor], int]:
+    """Select occupied tokens by class round-robin and stable identity hash."""
+    if semantics.device.type != "cpu":
+        semantics = semantics.detach().cpu()
+    if valid.device.type != "cpu":
+        valid = valid.detach().cpu()
+    valid = valid.bool() & semantics.ne(255)
+    queues = {}
+    present = set(int(x) for x in torch.unique(semantics[valid & semantics.lt(17)]).tolist())
+    for class_id in sorted(present):
+        xy = torch.nonzero((valid & semantics.eq(class_id)).any(dim=2), as_tuple=False)
+        coords = _coordinate_order(xy, seed, frame_token, class_id, max_tokens)
+        if coords:
+            queues[class_id] = deque(coords)
+    selected = []
+    class_order = sorted(queues, key=lambda c: _stable_int(seed, frame_token, "class", c))
+    while class_order and len(selected) < max_tokens:
+        next_order = []
+        for class_id in class_order:
+            if len(selected) >= max_tokens:
+                break
+            q = queues[class_id]
+            x, y = q.popleft()
+            selected.append(describe_token(semantics, valid, frame_token, scene_token, class_id, x, y))
+            if q:
+                next_order.append(class_id)
+        class_order = next_order
+    return selected, len(selected)
+
+
+def gather_features(feature: torch.Tensor, descriptors: Sequence[TokenDescriptor]) -> torch.Tensor:
+    """Mean BEV features at columns containing the token class; feature is [C,Y,X]."""
+    if feature.ndim != 3:
+        raise ValueError("feature must be [C,Y,X]")
+    _, ny, nx = feature.shape
+    vectors = []
+    for desc in descriptors:
+        x0, x1, y0, y1 = _bounds(desc.x, desc.y, nx, ny)
+        # Descriptor construction guarantees the centre class occupies at least the
+        # centre column. Use the full 5x5 local feature support only at occupied
+        # class columns; callers pass the aligned column mask separately when needed.
+        # With no label tensor here, retain the deterministic centre-column vector.
+        # extract_feature_records supplies the exact occupied-column mean below.
+        vectors.append(feature[:, desc.y, desc.x])
+    if not vectors:
+        return feature.new_zeros((0, feature.shape[0]))
+    return torch.stack(vectors, dim=0)
+
+
+def gather_occupied_column_features(
+    feature: torch.Tensor,
+    semantics: torch.Tensor,
+    valid: torch.Tensor,
+    descriptors: Sequence[TokenDescriptor],
+) -> torch.Tensor:
+    """Exact 5x5 occupied-column feature mean for each descriptor."""
+    if feature.ndim != 3:
+        raise ValueError("feature must be [C,Y,X]")
+    nx, ny, _ = semantics.shape
+    vectors = []
+    for desc in descriptors:
+        x0, x1, y0, y1 = _bounds(desc.x, desc.y, nx, ny)
+        columns = (valid[x0:x1, y0:y1, :].bool() & semantics[x0:x1, y0:y1, :].eq(desc.class_id)).any(dim=2)
+        xy = torch.nonzero(columns, as_tuple=False)
+        if xy.numel() == 0:
+            raise RuntimeError("descriptor lost occupied feature columns")
+        ys = xy[:, 1].to(feature.device) + y0
+        xs = xy[:, 0].to(feature.device) + x0
+        vectors.append(feature[:, ys, xs].mean(dim=1))
+    if not vectors:
+        return feature.new_zeros((0, feature.shape[0]))
+    return torch.stack(vectors, dim=0)
+
+
+def limit_bank(records: Iterable[TokenRecord], seed: int, per_class=64, total: int = 1024) -> List[TokenRecord]:
+    """Class cap with deterministic cross-frame round-robin."""
+    by_class_frame = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        d = record.descriptor
+        by_class_frame[d.class_id][d.frame_token].append(record)
+    kept = []
+    for class_id in sorted(by_class_frame):
+        frames = by_class_frame[class_id]
+        for values in frames.values():
+            values.sort(key=lambda r: _stable_int(seed, r.descriptor.identity))
+        frame_order = sorted(frames, key=lambda f: _stable_int(seed, class_id, f))
+        queues = {f: deque(frames[f]) for f in frame_order}
+        class_kept = []
+        class_cap = int(per_class.get(class_id, 0) if isinstance(per_class, dict) else per_class)
+        while frame_order and len(class_kept) < class_cap:
+            next_order = []
+            for frame in frame_order:
+                if len(class_kept) >= class_cap:
+                    break
+                class_kept.append(queues[frame].popleft())
+                if queues[frame]:
+                    next_order.append(frame)
+            frame_order = next_order
+        kept.extend(class_kept)
+    kept.sort(key=lambda r: (r.descriptor.class_id, _stable_int(seed, r.descriptor.identity)))
+    return kept[:total]
+
+
+def bank_summary(records: Sequence[TokenRecord]) -> Dict:
+    per_class = {}
+    for class_id in range(17):
+        rows = [r for r in records if r.descriptor.class_id == class_id]
+        per_class[str(class_id)] = {
+            "tokens": len(rows),
+            "frames": len({r.descriptor.frame_token for r in rows}),
+            "scenes": len({r.descriptor.scene_token for r in rows}),
+        }
+    return {"tokens": len(records), "per_class": per_class}
+===== END FILE sim2occ/tokens.py =====
+
+===== BEGIN FILE sim2occ/transport.py =====
+"""Candidate retrieval, balanced/dustbin OT, and real transport alignment."""
+import hashlib
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+
+from .protocol import (
+    GEOMETRY_WEIGHT,
+    MethodSpec,
+    SINKHORN_EPSILON,
+    SINKHORN_MARGINAL_TOLERANCE,
+    SINKHORN_MAX_ITER,
+)
+from .tokens import TokenDescriptor, TokenRecord
+
+
+@dataclass
+class TransportResult:
+    query_indices: List[int]
+    candidate_indices: List[int]
+    plan: torch.Tensor
+    values: torch.Tensor
+    match_ratio: torch.Tensor
+    row_residual: float
+    col_residual: float
+    entropy: float
+    dustbin_mass: float
+    candidate_changed: bool
+    shuffle_changed_fraction: float
+    value_change_l2: float
+
+
+def _stable_seed(*parts) -> int:
+    text = "|".join(str(x) for x in parts).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(text).digest()[:8], "big") % (2 ** 63 - 1)
+
+
+def feature_distance(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    q = F.normalize(q.float(), dim=-1, eps=1e-12)
+    k = F.normalize(k.float(), dim=-1, eps=1e-12)
+    return (1.0 - q @ k.transpose(0, 1)).clamp(-1e-6, 2.0 + 1e-6) / 2.0
+
+
+def coarse_distance(query: Sequence[TokenDescriptor], source: Sequence[TokenDescriptor], device) -> torch.Tensor:
+    q = torch.stack([d.g0 for d in query]).to(device=device, dtype=torch.float32)
+    s = torch.stack([d.g0 for d in source]).to(device=device, dtype=torch.float32)
+    return (q[:, None, :] - s[None, :, :]).abs().mean(dim=-1).clamp(0.0, 1.0)
+
+
+def fine_distance(query: Sequence[TokenDescriptor], source: Sequence[TokenDescriptor], device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    qs = torch.stack([d.support for d in query]).to(device=device, dtype=torch.float32)
+    ss = torch.stack([d.support for d in source]).to(device=device, dtype=torch.float32)
+    qp = torch.stack([d.occupancy for d in query]).to(device=device, dtype=torch.float32)
+    sp = torch.stack([d.occupancy for d in source]).to(device=device, dtype=torch.float32)
+    qv = torch.stack([d.occupancy_valid for d in query]).to(device=device)
+    sv = torch.stack([d.occupancy_valid for d in source]).to(device=device)
+    w = torch.minimum(qs[:, None, :], ss[None, :, :])
+    common_valid = qv[:, None, :] & sv[None, :, :]
+    w = w * common_valid.float()
+    denom = w.sum(dim=-1)
+    dist = (w * (qp[:, None, :] - sp[None, :, :]).abs()).sum(dim=-1) / denom.clamp_min(1e-12)
+    has_common = denom > 0
+    dist = torch.where(has_common, dist, torch.ones_like(dist)).clamp(0.0, 1.0)
+    overlap_denom = torch.maximum(qs[:, None, :], ss[None, :, :]).sum(dim=-1)
+    overlap = torch.minimum(qs[:, None, :], ss[None, :, :]).sum(dim=-1) / overlap_denom.clamp_min(1e-12)
+    overlap = torch.where(overlap_denom > 0, overlap, torch.zeros_like(overlap)).clamp(0.0, 1.0)
+    return dist, overlap, has_common
+
+
+def log_sinkhorn(
+    cost: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    epsilon: float = SINKHORN_EPSILON,
+    max_iter: int = SINKHORN_MAX_ITER,
+    tolerance: float = SINKHORN_MARGINAL_TOLERANCE,
+    allowed: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, float, float, int]:
+    """Log-domain balanced Sinkhorn with actual marginal residual stopping."""
+    if cost.ndim != 2 or a.ndim != 1 or b.ndim != 1:
+        raise ValueError("cost/a/b dimensions are invalid")
+    if cost.shape != (a.numel(), b.numel()):
+        raise ValueError("marginal dimensions do not match cost")
+    if not torch.isfinite(cost).all() or not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        raise FloatingPointError("nonfinite transport input")
+    if (a <= 0).any() or (b <= 0).any() or abs(float(a.sum() - b.sum())) > 1e-5:
+        raise ValueError("marginals must be positive and equal-mass")
+    log_k = -cost.float() / float(epsilon)
+    if allowed is not None:
+        if allowed.shape != cost.shape:
+            raise ValueError("allowed mask shape mismatch")
+        log_k = torch.where(allowed, log_k, torch.full_like(log_k, -1e9))
+    log_a, log_b = a.log(), b.log()
+    log_u = torch.zeros_like(a)
+    log_v = torch.zeros_like(b)
+    row_residual = col_residual = float("inf")
+    iterations = max_iter
+    row_projected = None
+    for iteration in range(max_iter):
+        log_u = log_a - torch.logsumexp(log_k + log_v[None, :], dim=1)
+        # Retain the row-normalised half iterate from the same Sinkhorn
+        # iteration.  Sparse dustbin problems can converge from opposite
+        # sides: the row half iterate has exact rows, while the following
+        # column half iterate has exact columns.  If the latter narrowly
+        # misses the frozen residual gate after the final iteration, their
+        # ergodic average is a support-preserving numerical stabilisation
+        # formed entirely from the prescribed iteration budget.
+        row_projected = torch.exp(log_u[:, None] + log_k + log_v[None, :])
+        log_v = log_b - torch.logsumexp(log_k + log_u[:, None], dim=0)
+        log_p = log_u[:, None] + log_k + log_v[None, :]
+        plan = torch.exp(log_p)
+        row_residual = float((plan.sum(dim=1) - a).abs().max().detach())
+        col_residual = float((plan.sum(dim=0) - b).abs().max().detach())
+        if max(row_residual, col_residual) <= tolerance:
+            iterations = iteration + 1
+            break
+    plan = torch.exp(log_u[:, None] + log_k + log_v[None, :])
+    if not torch.isfinite(plan).all():
+        raise FloatingPointError("nonfinite transport plan")
+    if max(row_residual, col_residual) > tolerance:
+        averaged = 0.5 * (row_projected + plan)
+        averaged_row_residual = float((averaged.sum(dim=1) - a).abs().max().detach())
+        averaged_col_residual = float((averaged.sum(dim=0) - b).abs().max().detach())
+        if max(averaged_row_residual, averaged_col_residual) <= tolerance:
+            plan = averaged
+            row_residual = averaged_row_residual
+            col_residual = averaged_col_residual
+        else:
+            # Versioned numerical recovery: keep the original accepted path
+            # exactly unchanged. Continue the same dual problem only on failure.
+            initial_residuals = [row_residual, col_residual,
+                                 averaged_row_residual, averaged_col_residual]
+            log_k64 = -cost.double() / float(epsilon)
+            if allowed is not None:
+                log_k64 = torch.where(allowed, log_k64, torch.full_like(log_k64, -float("inf")))
+            a64, b64 = a.double(), b.double()
+            u64, v64 = log_u.double(), log_v.double()
+            converged = False
+            for iteration in range(max_iter, max_iter + 1900):
+                u64 = a64.log() - torch.logsumexp(log_k64 + v64[None, :], dim=1)
+                v64 = b64.log() - torch.logsumexp(log_k64 + u64[:, None], dim=0)
+                # Gate the actual returned float32 plan, not just its float64 precursor.
+                candidate = torch.exp(u64[:, None] + log_k64 + v64[None, :]).float()
+                if not torch.isfinite(candidate).all():
+                    raise FloatingPointError("nonfinite transport recovery plan")
+                rr = float((candidate.sum(1) - a).abs().max().detach())
+                cr = float((candidate.sum(0) - b).abs().max().detach())
+                if max(rr, cr) <= tolerance:
+                    plan, row_residual, col_residual = candidate, rr, cr
+                    iterations = iteration + 1
+                    converged = True
+                    break
+            # Record every exceptional solve, including the original problem,
+            # for direct replay against the old and repaired solvers.
+            import os, json, time
+            from pathlib import Path
+            audit = os.environ.get("LANE_SINKHORN_AUDIT_DIR")
+            if audit:
+                folder = Path(audit); folder.mkdir(parents=True, exist_ok=True)
+                ident = "%d_%d" % (os.getpid(), time.time_ns())
+                snapshot = folder / (ident + ".pth")
+                torch.save(dict(cost=cost.detach().cpu(), a=a.detach().cpu(), b=b.detach().cpu(),
+                                allowed=None if allowed is None else allowed.detach().cpu(),
+                                epsilon=epsilon, max_iter=max_iter, tolerance=tolerance), str(snapshot))
+                with (folder / "events.jsonl").open("a") as stream:
+                    stream.write(json.dumps(dict(version="same_tolerance_continuation_v1",
+                        time=time.time(), snapshot=str(snapshot), initial_residuals=initial_residuals,
+                        converged=converged, iterations=iterations if converged else max_iter+1900,
+                        row_residual=rr, col_residual=cr, tolerance=tolerance)) + "\n")
+            if not converged:
+                raise RuntimeError("Sinkhorn recovery exhausted without meeting unchanged tolerance: row=%g col=%g tolerance=%g" % (rr, cr, tolerance))
+    return plan, row_residual, col_residual, iterations
+
+
+def _candidate_lists(
+    spec: MethodSpec,
+    queries: Sequence[TokenDescriptor],
+    query_keys: torch.Tensor,
+    bank: Sequence[TokenRecord],
+    seed: int,
+    event: int,
+    k: int = 16,
+) -> Tuple[List[List[int]], bool]:
+    lists = []
+    any_changed = False
+    for qi, query in enumerate(queries):
+        eligible = [
+            idx for idx, row in enumerate(bank)
+            if row.descriptor.class_id == query.class_id and
+            not (spec.bank_domain == "real" and row.descriptor.scene_token == query.scene_token)
+        ]
+        if not eligible:
+            lists.append([])
+            continue
+        keys = torch.stack([bank[idx].key for idx in eligible]).to(query_keys.device)
+        df = feature_distance(query_keys[qi:qi + 1], keys)[0]
+        source_desc = [bank[idx].descriptor for idx in eligible]
+        dg0 = coarse_distance([query], source_desc, query_keys.device)[0]
+        base_score = 0.5 * df + 0.5 * dg0
+        if spec.module_a:
+            dg1, overlap, _ = fine_distance([query], source_desc, query_keys.device)
+            score = 0.5 * df + 0.5 * dg1[0] + 0.25 * (1.0 - overlap[0])
+        else:
+            score = base_score
+        base_order = sorted(range(len(eligible)), key=lambda j: (float(base_score[j]), eligible[j]))[:k]
+        if spec.random_candidates:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(_stable_seed(seed, event, query.identity, "random"))
+            order = torch.randperm(len(eligible), generator=generator).tolist()[:k]
+        else:
+            order = sorted(range(len(eligible)), key=lambda j: (float(score[j]), eligible[j]))[:k]
+        chosen = [eligible[j] for j in order]
+        lists.append(chosen)
+        # Candidate quality is a set-level claim.  A mere rank permutation does
+        # not alter the dense OT union and must not be counted as an A change.
+        any_changed |= set(chosen) != {eligible[j] for j in base_order}
+    return lists, any_changed
+
+
+def _entropy(plan: torch.Tensor) -> float:
+    positive = plan[plan > 0]
+    return float((-(positive * positive.log()).sum()).detach()) if positive.numel() else 0.0
+
+
+def solve_block(
+    spec: MethodSpec,
+    query_indices: Sequence[int],
+    descriptors: Sequence[TokenDescriptor],
+    query_keys: torch.Tensor,
+    bank: Sequence[TokenRecord],
+    seed: int,
+    event: int,
+    retrieval_top_k: int = 16,
+    dustbin_cost: float = 0.5,
+) -> Optional[TransportResult]:
+    block_desc = [descriptors[i] for i in query_indices]
+    block_keys = query_keys[list(query_indices)]
+    lists, candidate_changed = _candidate_lists(spec, block_desc, block_keys, bank, seed, event, k=retrieval_top_k)
+    union = sorted({idx for rows in lists for idx in rows})
+    if not union:
+        return None
+    source_desc = [bank[idx].descriptor for idx in union]
+    source_keys = torch.stack([bank[idx].key for idx in union]).to(block_keys.device)
+    source_values = torch.stack([bank[idx].value for idx in union]).to(block_keys.device)
+    df = feature_distance(block_keys, source_keys)
+    dg0 = coarse_distance(block_desc, source_desc, block_keys.device)
+    if spec.module_b:
+        dg1, overlap, common = fine_distance(block_desc, source_desc, block_keys.device)
+        real_cost = (1.0 - GEOMETRY_WEIGHT) * df + GEOMETRY_WEIGHT * dg1 + 0.25 * (1.0 - overlap)
+        n, m = real_cost.shape
+        cost = real_cost.new_full((n + 1, m + 1), float(dustbin_cost))
+        cost[:n, :m] = real_cost
+        cost[n, m] = 0.0
+        allowed = torch.ones_like(cost, dtype=torch.bool)
+        allowed[:n, :m] = common
+        a = torch.cat((torch.full((n,), 1.0 / n, device=cost.device), cost.new_tensor([1.0])))
+        b = torch.cat((torch.full((m,), 1.0 / m, device=cost.device), cost.new_tensor([1.0])))
+        full, rr, cr, _ = log_sinkhorn(cost, a, b, allowed=allowed)
+        plan = full[:n, :m]
+        row_mass = plan.sum(dim=1)
+        ratio = row_mass / a[:n]
+        # The absolute row-marginal tolerance implies a relative tolerance of
+        # tol/a_i for r_i.  Using a tighter unrelated constant would reject an
+        # otherwise accepted plan, especially for four-query blocks (a_i=.25).
+        ratio_tolerance = SINKHORN_MARGINAL_TOLERANCE / float(a[:n].min()) + 1e-6
+        if (ratio < -ratio_tolerance).any() or (ratio > 1.0 + ratio_tolerance).any():
+            raise RuntimeError(
+                "dustbin match ratio outside residual-derived tolerance: "
+                "min=%g max=%g tol=%g row_residual=%g" %
+                (float(ratio.min()), float(ratio.max()), ratio_tolerance, rr)
+            )
+        ratio = ratio.clamp(0.0, 1.0)
+        dustbin_mass = float((full[:n, m].sum() + full[n, :m].sum()).detach())
+    else:
+        cost = 0.5 * df + 0.5 * dg0
+        n, m = cost.shape
+        a = torch.full((n,), 1.0 / n, device=cost.device)
+        b = torch.full((m,), 1.0 / m, device=cost.device)
+        plan, rr, cr, _ = log_sinkhorn(cost, a, b)
+        row_mass = plan.sum(dim=1)
+        ratio = torch.ones(n, device=cost.device)
+        dustbin_mass = 0.0
+
+    aligned = plan @ source_values / row_mass[:, None].clamp_min(1e-12)
+    original_aligned = aligned
+    shuffle_fraction = 0.0
+    value_change = 0.0
+    if spec.shuffle_values:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(_stable_seed(seed, event, *(d.identity for d in block_desc), "shuffle"))
+        perm = torch.randperm(source_values.shape[0], generator=generator).to(source_values.device)
+        shuffled = source_values[perm]
+        aligned = plan @ shuffled / row_mass[:, None].clamp_min(1e-12)
+        shuffle_fraction = float((perm != torch.arange(len(perm), device=perm.device)).float().mean())
+        value_change = float((aligned - original_aligned).norm(dim=1).mean().detach())
+    return TransportResult(
+        query_indices=list(query_indices),
+        candidate_indices=union,
+        plan=plan,
+        values=aligned,
+        match_ratio=ratio,
+        row_residual=rr,
+        col_residual=cr,
+        entropy=_entropy(plan),
+        dustbin_mass=dustbin_mass,
+        candidate_changed=candidate_changed,
+        shuffle_changed_fraction=shuffle_fraction,
+        value_change_l2=value_change,
+    )
+
+
+def align_queries(
+    spec: MethodSpec,
+    descriptors: Sequence[TokenDescriptor],
+    query_keys: torch.Tensor,
+    bank: Sequence[TokenRecord],
+    seed: int,
+    event: int,
+    retrieval_top_k: int = 16,
+    dustbin_cost: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Dict]]:
+    """Return aligned values, ratios, valid flags in original query order."""
+    count, channels = query_keys.shape
+    aligned = query_keys.new_zeros((count, channels))
+    ratios = query_keys.new_zeros(count)
+    accepted = torch.zeros(count, dtype=torch.bool, device=query_keys.device)
+    diagnostics = []
+    if spec.prototype:
+        for idx, desc in enumerate(descriptors):
+            rows = [r.value for r in bank if r.descriptor.class_id == desc.class_id]
+            if rows:
+                aligned[idx] = torch.stack(rows).to(query_keys.device).mean(dim=0)
+                ratios[idx] = 1.0
+                accepted[idx] = True
+        return aligned, ratios, accepted, diagnostics
+
+    by_class = {}
+    for idx, desc in enumerate(descriptors):
+        by_class.setdefault(desc.class_id, []).append(idx)
+    for class_id, indices in sorted(by_class.items()):
+        for start in range(0, len(indices), 4):
+            block = indices[start:start + 4]
+            result = solve_block(spec, block, descriptors, query_keys, bank, seed, event, retrieval_top_k=retrieval_top_k, dustbin_cost=dustbin_cost)
+            if result is None:
+                continue
+            for local, global_idx in enumerate(result.query_indices):
+                if float(result.match_ratio[local]) > 1e-12:
+                    aligned[global_idx] = result.values[local]
+                    ratios[global_idx] = result.match_ratio[local]
+                    accepted[global_idx] = True
+            diagnostics.append({
+                "class_id": class_id,
+                "queries": len(block),
+                "candidate_union": len(result.candidate_indices),
+                "requested_top_k": int(retrieval_top_k),
+                "dustbin_cost": float(dustbin_cost),
+                "geometry_weight": GEOMETRY_WEIGHT,
+                "row_residual": result.row_residual,
+                "col_residual": result.col_residual,
+                "entropy": result.entropy,
+                "dustbin_mass": result.dustbin_mass,
+                "match_ratio": [float(x) for x in result.match_ratio.detach().cpu()],
+                "candidate_changed": result.candidate_changed,
+                "shuffle_changed_fraction": result.shuffle_changed_fraction,
+                "value_change_l2": result.value_change_l2,
+            })
+    return aligned, ratios, accepted, diagnostics
+
+
+def transfer_loss(
+    student_tokens: torch.Tensor,
+    aligned_values: torch.Tensor,
+    match_ratio: torch.Tensor,
+    accepted: torch.Tensor,
+    n_all: int,
+    eta: float = 0.5,
+) -> torch.Tensor:
+    if n_all <= 0:
+        return student_tokens.sum() * 0.0
+    z = F.normalize(student_tokens, dim=-1, eps=1e-12)
+    v = F.normalize(aligned_values.detach(), dim=-1, eps=1e-12)
+    r = match_ratio.detach().clamp(0.0, 1.0)
+    target_raw = (1.0 - eta * r[:, None]) * z.detach() + eta * r[:, None] * v
+    target_norm = target_raw.norm(dim=-1)
+    valid = accepted & (target_norm > 1e-12)
+    if not valid.any():
+        return z.sum() * 0.0
+    target = F.normalize(target_raw[valid], dim=-1, eps=1e-12).detach()
+    terms = 1.0 - F.cosine_similarity(z[valid], target, dim=-1, eps=1e-12)
+    return terms.sum() / float(n_all)
+===== END FILE sim2occ/transport.py =====
+
+===== BEGIN FILE sim2occ/adapters.py =====
+"""Native dense-feature sampling and auxiliary-gradient budgeting."""
+import math
+
+import torch
+
+def occupied_features(feature,descriptors,semantics,valid):
+    if tuple(feature.shape[1:])!=tuple(semantics.shape):
+        raise ValueError('Feature and label coordinate grids differ')
+    out=[];nx,ny,nz=semantics.shape
+    for d in descriptors:
+        x0,x1=max(0,d.x-2),min(nx,d.x+3)
+        y0,y1=max(0,d.y-2),min(ny,d.y+3)
+        support=valid[x0:x1,y0:y1].bool() & semantics[x0:x1,y0:y1].eq(d.class_id)
+        assert support.any()
+        out.append(feature[:,x0:x1,y0:y1,:][:,support.to(feature.device)].mean(-1))
+    return torch.stack(out)
+
+
+def gradients_norm(grads) -> float:
+    terms = [g.detach().float().pow(2).sum(dtype=torch.float64) for g in grads if g is not None]
+    if not terms:
+        return 0.0
+    return float(torch.sqrt(torch.stack(terms).sum()))
+
+
+def _gradient_dot(left, right):
+    dot = None
+    shared = 0
+    for a, b in zip(left, right):
+        if a is not None and b is not None:
+            term = (a.detach().float() * b.detach().float()).sum(dtype=torch.float64)
+            dot = term if dot is None else dot + term
+            shared += 1
+    return (0.0 if dot is None else float(dot), shared)
+
+
+def merge_gradients(params, main_grads, aux_grads, maximum_weight):
+    main_norm = gradients_norm(main_grads)
+    aux_norm = gradients_norm(aux_grads)
+    dot, shared = _gradient_dot(main_grads, aux_grads)
+    cosine = None if main_norm <= 1e-12 or aux_norm <= 1e-12 else dot / (main_norm * aux_norm)
+    if not all(math.isfinite(x) for x in (main_norm, aux_norm, dot)) or (cosine is not None and not math.isfinite(cosine)):
+        raise FloatingPointError("nonfinite Phase2G gradient statistics")
+    if main_norm <= 1e-12:
+        raise RuntimeError("main gradient norm is zero")
+    weight = 0.0 if aux_norm <= 1e-12 else min(float(maximum_weight), 0.10 * main_norm / aux_norm)
+    for parameter, main, auxiliary in zip(params, main_grads, aux_grads):
+        if main is None:
+            parameter.grad = None if auxiliary is None or weight == 0 else auxiliary.detach().mul(weight)
+        elif auxiliary is None or weight == 0:
+            parameter.grad = main.detach()
+        else:
+            parameter.grad = main.detach().add(auxiliary.detach(), alpha=weight)
+    return {
+        "main_norm": main_norm,
+        "aux_norm": aux_norm,
+        "dot": dot,
+        "cosine": cosine,
+        "shared_parameter_tensors": shared,
+        "applied_weight": weight,
+        "weighted_aux_ratio": 0.0 if main_norm <= 1e-12 else weight * aux_norm / main_norm,
+    }
+===== END FILE sim2occ/adapters.py =====
+
